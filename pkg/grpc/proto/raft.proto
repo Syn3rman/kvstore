@@ -1,0 +1,49 @@
+// raft.proto
+syntax = "proto3";
+
+package raft;
+
+option go_package = "./raftpb";
+
+service RaftService {
+    rpc JoinCluster(JoinRequest) returns (JoinResponse) {}
+    rpc RequestVote(VoteRequest) returns (VoteResponse) {}
+    rpc SendHeartbeat(HeartbeatRequest) returns (HeartbeatResponse) {}
+}
+
+message JoinRequest {
+    string node_id = 1;
+    string host = 2;
+    int32 port = 3;
+}
+
+message JoinResponse {
+    bool success = 1;
+    map<string, NodeConfig> cluster_nodes = 2;
+}
+
+message VoteRequest {
+    int32 term = 1;
+    string candidate_id = 2;
+}
+
+message VoteResponse {
+    int32 term = 1;
+    bool vote_granted = 2;
+}
+
+message HeartbeatRequest {
+    int32 term = 1;
+    string leader_id = 2;
+    map<string, NodeConfig> nodes = 3;
+}
+
+message HeartbeatResponse {
+    bool success = 1;
+}
+
+message NodeConfig {
+    string node_id = 1;
+    string host = 2;
+    int32 port = 3;
+}
