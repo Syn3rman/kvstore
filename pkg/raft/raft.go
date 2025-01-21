@@ -63,9 +63,9 @@ type Node struct {
 	logger *log.Logger
 }
 
-func randomTimeout() time.Duration {
+func randomTimeout(minTimeout int, maxTimeout int) time.Duration {
 	return time.Millisecond * time.Duration(
-		rand.Intn(MaxTimeout-MinTimeout)+MinTimeout,
+		rand.Intn(maxTimeout-minTimeout)+minTimeout,
 	)
 }
 
@@ -106,15 +106,13 @@ func NewNode(cfg *config.Config) *Node {
 func (n *Node) run() {
 	for {
 		n.logger.Printf("Current state: %v", n.state)
-		if len(n.nodes) == 1 || n.state == Leader {
-			n.runLeader()
-			continue
-		}
 		switch n.state {
 		case Follower:
 			n.runFollower()
 		case Candidate:
 			n.runCandidate()
+		case Leader:
+			n.runLeader()
 		}
 	}
 }
@@ -129,6 +127,9 @@ func (n *Node) runFollower() {
 				n.handleHeartbeat(heartbeat)
 			case <-n.electionTimer.C:
 				n.logger.Printf("Election timer fired. Transitioning to Candidate.")
+				// remove leader from hash ring and become candidate
+				n.removeNode(n.leader, "no heartbeat from leader")
+				n.leader = ""
 				n.becomeCandidate()
 				return
 			}
@@ -136,6 +137,14 @@ func (n *Node) runFollower() {
 }
 
 func (n *Node) runCandidate() {
+	n.logger.Printf("Running in Candidate state.")
+	// if only one node, become leader
+	if len(n.nodes) == 1 {
+		n.logger.Printf("Only one node in the cluster. Becoming Leader.")
+		n.becomeLeader()
+		return
+	}
+
 	// Prepare vote request
 	voteRequest := &pb.VoteRequest{
 		Term:        n.term,
@@ -189,8 +198,8 @@ func (n *Node) StartServer() error {
     return nil
 }
 
-func (n *Node) resetElectionTimer() {
-	n.electionTimer.Reset(randomTimeout())
+func (n *Node) resetElectionTimer(electionTimeout int) {
+	n.electionTimer.Reset(randomTimeout(electionTimeout, electionTimeout*2))
 }
 
 func (n *Node) broadcastVoteRequests(voteRequest *pb.VoteRequest, done chan bool) {
@@ -267,6 +276,7 @@ func (n *Node) handleElectionResult(done chan bool) {
 			n.handleHeartbeat(heartbeat)
 			if n.state == Follower {
 				n.logger.Printf("Received valid heartbeat. Stepping down to Follower.")
+				n.becomeFollower("received heartbeat")
 				return
 			}
 		case <-n.electionTimer.C:
@@ -288,7 +298,7 @@ func (n *Node) becomeFollower(reason string) {
 	if reason == "higher term detected" {
 		n.leader = ""
 	}
-	n.resetElectionTimer()
+	n.resetElectionTimer(n.config.ElectionTimeout)
 }
 
 
@@ -300,7 +310,7 @@ func (n *Node) becomeCandidate() {
 	n.term++
 	n.votedFor = n.nodeConfig.NodeID
 
-	n.resetElectionTimer()
+	n.resetElectionTimer(n.config.ElectionTimeout)
 }
 
 func (n *Node) requestVoteFromNode(nodeConfig config.NodeConfig, voteRequest *pb.VoteRequest) (*pb.VoteResponse, error) {
@@ -352,7 +362,7 @@ func (n *Node) RequestVote(ctx context.Context, voteRequest *pb.VoteRequest) (*p
 	if n.votedFor == "" || n.votedFor == voteRequest.CandidateId {
 		voteResponse.VoteGranted = true
 		n.votedFor = voteRequest.CandidateId
-		n.resetElectionTimer()
+		n.resetElectionTimer(n.config.ElectionTimeout)
 		n.logger.Printf("Granted vote to %s for term %d", voteRequest.CandidateId, voteRequest.Term)
 	} else {
 		n.logger.Printf("Rejected vote request from %s (already voted for %s in term %d)", voteRequest.CandidateId, n.votedFor, n.term)
@@ -390,7 +400,7 @@ func (n *Node) handleVoteRequest(req *pb.VoteRequest) *pb.VoteResponse {
 	if n.votedFor == "" || n.votedFor == req.CandidateId {
 		resp.VoteGranted = true
 		n.votedFor = req.CandidateId
-		n.resetElectionTimer()
+		n.resetElectionTimer(n.config.ElectionTimeout)
 		n.logger.Printf("Granted vote to candidate %s for term %d", req.CandidateId, req.Term)
 	} else {
 		n.logger.Printf("Rejected vote request from candidate %s (already voted for %s in term %d)", req.CandidateId, n.votedFor, n.term)
@@ -407,6 +417,7 @@ func (n *Node) becomeLeader() {
 	n.state = Leader
 	n.leader = n.nodeConfig.NodeID
 	n.electionTimer.Stop()
+	n.logger.Printf("Node %s has become the Leader for term %d.", n.nodeConfig.NodeID, n.term)
 }
 
 func (n *Node) handleHeartbeat(heartbeat *pb.HeartbeatRequest) {
@@ -444,7 +455,7 @@ func (n *Node) handleHeartbeat(heartbeat *pb.HeartbeatRequest) {
 
         n.leader = heartbeat.LeaderId
         go n.updateHashRing(heartbeat.Nodes)
-        n.resetElectionTimer()
+        n.resetElectionTimer(n.config.ElectionTimeout)
 
         n.logger.Printf("Heartbeat from leader %s accepted. Resetting election timer.",
             heartbeat.LeaderId)
@@ -548,8 +559,6 @@ func (n *Node) HandleJoinRequest(ctx context.Context, req *pb.JoinRequest) {
         return
     }
 
-	n.logger.Printf("hehe")
-
 	// Add the new node to the cluster
 	newNode := config.NodeConfig{
 		NodeID: req.NodeId,
@@ -559,9 +568,7 @@ func (n *Node) HandleJoinRequest(ctx context.Context, req *pb.JoinRequest) {
 	n.hashRing.AddNode(newNode)
 	n.nodes[req.NodeId] = newNode
 
-	n.logger.Printf("hehe")
 	n.broadcastClusterUpdate()
-	n.logger.Printf("hoho")
     n.logger.Printf("Successfully added node %s to cluster", req.NodeId)
     response.Success = true
 }
@@ -634,12 +641,12 @@ func (n *Node) sendHeartbeats() {
 
 				resp, err := client.SendHeartbeat(ctx, heartbeat)
 				if err != nil {
-					n.logger.Printf("Failed to send heartbeat to node %s (%s:%d): %v", nodeID, nodeConfig.Host, nodeConfig.Port, err)
+					n.removeNode(nodeID, "heartbeat failure")
 					return
 				}
 
 				if !resp.Success {
-					n.logger.Printf("Heartbeat to node %s not successful", nodeID)
+					n.removeNode(nodeID, "unsuccessful heartbeat response")
 				} else {
 					n.logger.Printf("Heartbeat to node %s successful", nodeID)
 				}
@@ -651,6 +658,15 @@ func (n *Node) sendHeartbeats() {
 	n.heartbeatTimer.Reset(time.Duration(n.config.HeartbeatTimeout) * time.Millisecond)
 }
 
+func (n *Node) removeNode(nodeID, reason string) {
+    n.mu.Lock()
+    defer n.mu.Unlock()
+
+    n.logger.Printf("Removing node %s from cluster due to: %s", nodeID, reason)
+    n.hashRing.RemoveNode(nodeID)
+    delete(n.nodes, nodeID)
+}
+
 func (n *Node) SendHeartbeat(ctx context.Context, req *pb.HeartbeatRequest) (*pb.HeartbeatResponse, error) {
 	n.heartbeatCh <- req
 
@@ -659,7 +675,7 @@ func (n *Node) SendHeartbeat(ctx context.Context, req *pb.HeartbeatRequest) (*pb
         if heartbeatResp, ok := resp.(*pb.HeartbeatResponse); ok {
 			n.logger.Printf("Received heartbeat response: %v", heartbeatResp)
 			n.mu.Lock()
-			n.electionTimer.Reset(randomTimeout())
+			n.resetElectionTimer(n.config.ElectionTimeout)
 			n.mu.Unlock()
             return heartbeatResp, nil
         }
